@@ -168,14 +168,23 @@ $dayDefs = @(
     @{ Order = 6; Label = 'Saturday';  Match = 'Saturda'   }
 )
 
-function Get-DayInfo($row) {
-    foreach ($d in $dayDefs) {
-        $col = $headers | Where-Object { $_ -like ($d.Match + '*') } | Select-Object -First 1
-        if ($col -and ("$($row.$col)".Trim().ToUpper() -eq 'X')) {
-            return [pscustomobject]@{ Order = $d.Order; Label = $d.Label }
+# Resolve the actual day-column header names once (handles truncation).
+$dayColMap = foreach ($d in $dayDefs) {
+    $col = $headers | Where-Object { $_ -like ($d.Match + '*') } | Select-Object -First 1
+    [pscustomobject]@{ Order = $d.Order; Label = $d.Label; Col = $col }
+}
+
+# Returns EVERY day marked with an "X" for a row (multi-day courses mark more
+# than one). Falls back to a single "(No Day)" entry when none are marked.
+function Get-DayList($row) {
+    $hits = @()
+    foreach ($d in $dayColMap) {
+        if ($d.Col -and ("$($row.$($d.Col))".Trim().ToUpper() -eq 'X')) {
+            $hits += [pscustomobject]@{ Order = $d.Order; Label = $d.Label }
         }
     }
-    return [pscustomobject]@{ Order = 99; Label = '(No Day)' }
+    if ($hits.Count -eq 0) { $hits = ,([pscustomobject]@{ Order = 99; Label = '(No Day)' }) }
+    return $hits
 }
 
 function Get-TimeSortKey([string]$t) {
@@ -238,17 +247,20 @@ if ($synthRows.Count -gt 0) {
 }
 
 # ---- Sort -----------------------------------------------------------------
+# Expand each row into one entry per marked day (multi-day courses appear on
+# every day they run).
 $enriched = foreach ($row in $dataRows) {
-    $di = Get-DayInfo $row
-    [pscustomobject]@{
-        Row       = $row
-        DayOrder  = $di.Order
-        DayLabel  = $di.Label
-        RoomKey   = "$($row.$cRoom)"
-        PeriodKey = "$($row.$cPeriod)"
-        TitleKey  = "$($row.$cTitle)"
-        TimeKey   = Get-TimeSortKey "$($row.$cStart)"
-        IsSynth   = [bool]$row.'_Synth'
+    foreach ($di in (Get-DayList $row)) {
+        [pscustomobject]@{
+            Row       = $row
+            DayOrder  = $di.Order
+            DayLabel  = $di.Label
+            RoomKey   = "$($row.$cRoom)"
+            PeriodKey = "$($row.$cPeriod)"
+            TitleKey  = "$($row.$cTitle)"
+            TimeKey   = Get-TimeSortKey "$($row.$cStart)"
+            IsSynth   = [bool]$row.'_Synth'
+        }
     }
 }
 
