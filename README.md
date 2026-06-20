@@ -112,3 +112,9 @@ After the one‑time setup, you **don't** need to repeat Steps 1–7. Just open 
 ---
 
 *Built with ❤️ for our Troop. Questions or improvements welcome — open an issue or a pull request.*
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE) — free to use, modify, and share.
