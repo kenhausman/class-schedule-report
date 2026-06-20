@@ -1,0 +1,445 @@
+<#
+.SYNOPSIS
+    Reads a Class Completion Data .xls/.xlsx export, sorts it by
+    Day of Week -> Room Name -> Period Name -> Period Start Time,
+    and generates a styled, self-contained HTML report.
+
+.DESCRIPTION
+    Works on any Windows PC that has Microsoft Excel installed (used only
+    to read the legacy binary .xls). No extra modules required.
+
+.PARAMETER InputPath
+    One or more source spreadsheets (.xls or .xlsx). Accepts a comma-separated
+    list, an array, or wildcards. When multiple files are given, all of their
+    rows are merged into a single report (use the Unit filter to separate them).
+    Defaults to every "Class_Data_*.xls*" file in your Downloads folder.
+
+.PARAMETER OutputPath
+    Path for the generated HTML report.
+    Defaults to "<name>_Sorted.html" for a single file, or
+    "Class_Report_Combined_<date>.html" when multiple files are merged.
+
+.EXAMPLE
+    .\Generate-ClassReport.ps1
+
+.EXAMPLE
+    .\Generate-ClassReport.ps1 -InputPath "C:\data\Class_Data.xlsx" -OutputPath "C:\data\report.html"
+
+.EXAMPLE
+    # Merge several unit exports into one report
+    .\Generate-ClassReport.ps1 -InputPath "C:\data\Troop962.xlsx","C:\data\Troop17.xlsx","C:\data\Pack5.xlsx"
+
+.EXAMPLE
+    # Merge everything matching a wildcard
+    .\Generate-ClassReport.ps1 -InputPath "C:\data\*.xlsx"
+#>
+
+[CmdletBinding()]
+param(
+    [string[]]$InputPath,
+    [string]$OutputPath
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ---- Resolve input files --------------------------------------------------
+if (-not $InputPath -or $InputPath.Count -eq 0) {
+    $dl = Join-Path $env:USERPROFILE 'Downloads'
+    $candidates = Get-ChildItem -Path $dl -Filter 'Class_Data_*.xls*' -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending
+    if (-not $candidates) {
+        throw "No input file given and no 'Class_Data_*.xls*' found in $dl. Use -InputPath."
+    }
+    $InputPath = $candidates.FullName
+}
+
+# Expand wildcards and de-duplicate, preserving order.
+# Also split any comma-joined element so both `-InputPath a,b` (in-session
+# array) and `powershell -File ... -InputPath "a,b"` styles work.
+$inputFiles = @()
+$patterns = @()
+foreach ($item in $InputPath) {
+    foreach ($piece in ($item -split ',')) {
+        $piece = $piece.Trim().Trim('"')
+        if ($piece) { $patterns += $piece }
+    }
+}
+foreach ($pattern in $patterns) {
+    $resolved = Resolve-Path -Path $pattern -ErrorAction SilentlyContinue
+    if (-not $resolved) { throw "Input file not found: $pattern" }
+    foreach ($rp in $resolved) {
+        if ($inputFiles -notcontains $rp.Path) { $inputFiles += $rp.Path }
+    }
+}
+if ($inputFiles.Count -eq 0) { throw "No input files resolved from -InputPath." }
+
+if (-not $OutputPath) {
+    $dir = Split-Path $inputFiles[0] -Parent
+    if ($inputFiles.Count -eq 1) {
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($inputFiles[0])
+        $OutputPath = Join-Path $dir ($name + '_Sorted.html')
+    } else {
+        $OutputPath = Join-Path $dir ('Class_Report_Combined_' + (Get-Date -Format 'yyyy_MM_dd') + '.html')
+    }
+}
+
+Write-Host ("Reading : {0} file(s)" -f $inputFiles.Count)
+
+# ---- Read the workbook(s) via Excel COM -----------------------------------
+$excel = $null
+$dataRows = @()
+$headers  = @()   # canonical headers, taken from the first file
+try {
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+
+    foreach ($file in $inputFiles) {
+        Write-Host "          - $(Split-Path $file -Leaf)"
+        $wb = $excel.Workbooks.Open($file, [Type]::Missing, $true) # read-only
+        try {
+            $ws = $wb.Sheets.Item(1)
+            $used = $ws.UsedRange
+            $rowCount = $used.Rows.Count
+            $colCount = $used.Columns.Count
+            $grid = $used.Value2
+
+            # Read this file's header row.
+            $fileHeaders = @()
+            for ($c = 1; $c -le $colCount; $c++) {
+                $h = $grid[1, $c]
+                if ($null -eq $h) { $h = "Col$c" }
+                $fileHeaders += [string]$h.ToString().Trim()
+            }
+
+            if ($headers.Count -eq 0) { $headers = $fileHeaders }
+
+            # Map each canonical header to a column index in THIS file
+            # (exact match first, then prefix match to tolerate truncation).
+            $colMap = @{}
+            foreach ($cn in $headers) {
+                $idx = [array]::IndexOf($fileHeaders, $cn)
+                if ($idx -lt 0) {
+                    for ($k = 0; $k -lt $fileHeaders.Count; $k++) {
+                        if ($fileHeaders[$k] -like ($cn + '*') -or $cn -like ($fileHeaders[$k] + '*')) { $idx = $k; break }
+                    }
+                }
+                $colMap[$cn] = $idx  # -1 if absent
+            }
+
+            for ($r = 2; $r -le $rowCount; $r++) {
+                $obj = [ordered]@{}
+                foreach ($cn in $headers) {
+                    $idx = $colMap[$cn]
+                    $v = if ($idx -ge 0) { $grid[$r, ($idx + 1)] } else { $null }
+                    $obj[$cn] = if ($null -eq $v) { '' } else { [string]$v.ToString().Trim() }
+                }
+                $row = [pscustomobject]$obj
+                $row | Add-Member -NotePropertyName '_Source' -NotePropertyValue (Split-Path $file -Leaf)
+                $dataRows += $row
+            }
+        }
+        finally {
+            if ($wb) { $wb.Close($false) | Out-Null }
+            if ($ws) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws) | Out-Null }
+            if ($wb) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) | Out-Null }
+            $ws = $null; $wb = $null
+        }
+    }
+}
+finally {
+    if ($excel) { $excel.Quit() }
+    if ($excel) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null }
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+}
+
+Write-Host ("Loaded  : {0} rows from {1} file(s), {2} columns" -f $dataRows.Count, $inputFiles.Count, $headers.Count)
+
+# ---- Helpers --------------------------------------------------------------
+
+# Day columns (export truncates some names). Map header -> order + clean label.
+$dayDefs = @(
+    @{ Order = 0; Label = 'Sunday';    Match = 'Sunday'    },
+    @{ Order = 1; Label = 'Monday';    Match = 'Monday'    },
+    @{ Order = 2; Label = 'Tuesday';   Match = 'Tuesday'   },
+    @{ Order = 3; Label = 'Wednesday'; Match = 'Wednesda'  },
+    @{ Order = 4; Label = 'Thursday';  Match = 'Thursda'   },
+    @{ Order = 5; Label = 'Friday';    Match = 'Friday'    },
+    @{ Order = 6; Label = 'Saturday';  Match = 'Saturda'   }
+)
+
+function Get-DayInfo($row) {
+    foreach ($d in $dayDefs) {
+        $col = $headers | Where-Object { $_ -like ($d.Match + '*') } | Select-Object -First 1
+        if ($col -and ("$($row.$col)".Trim().ToUpper() -eq 'X')) {
+            return [pscustomobject]@{ Order = $d.Order; Label = $d.Label }
+        }
+    }
+    return [pscustomobject]@{ Order = 99; Label = '(No Day)' }
+}
+
+function Get-TimeSortKey([string]$t) {
+    if ([string]::IsNullOrWhiteSpace($t)) { return [double]99999 }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParse($t, [ref]$dt)) { return [double]($dt.TimeOfDay.TotalMinutes) }
+    return [double]99998
+}
+
+function HtmlEncode([string]$s) {
+    if ($null -eq $s) { return '' }
+    return [System.Web.HttpUtility]::HtmlEncode($s)
+}
+Add-Type -AssemblyName System.Web
+
+# Resolve actual header names we display (handles trailing-space quirks).
+function ColName($pattern) { ($headers | Where-Object { $_ -like $pattern } | Select-Object -First 1) }
+$cRoom   = ColName 'Room Name*'
+$cPeriod = ColName 'Period Name*'
+$cStart  = ColName 'Period Start Time*'
+$cEnd    = ColName 'Class End Time*'
+$cTitle  = ColName 'Class Title*'
+$cNum    = ColName 'Class Number*'
+$cInstr  = ColName 'Instructor Name*'
+$cAtt    = ColName 'Attendee Name*'
+$cUnit   = ColName 'Unit*'
+
+# ---- Fix provider data error: full-day classes mislabeled as Morning ------
+# Some rows are tagged "Morning Session" but run 8:30 AM -> 4:30 PM, i.e. they
+# span both the morning AND afternoon sessions, yet no matching afternoon row
+# exists. For each such row we add a duplicate that appears as a proper
+# "Afternoon Session" entry so it shows up in the afternoon as well.
+
+# Canonical afternoon start time, derived from the data (fallback 1:30 PM).
+$afternoonStart = ($dataRows |
+    Where-Object { "$($_.$cPeriod)" -like 'Afternoon*' -and "$($_.$cStart)".Trim() } |
+    Group-Object { "$($_.$cStart)".Trim() } |
+    Sort-Object Count -Descending | Select-Object -First 1).Name
+if (-not $afternoonStart) { $afternoonStart = '1:30 PM' }
+$afternoonStartMin = Get-TimeSortKey $afternoonStart
+
+$synthRows = @()
+foreach ($row in $dataRows) {
+    if ("$($row.$cPeriod)" -notlike 'Morning*') { continue }
+    $endMin = Get-TimeSortKey "$($row.$cEnd)"
+    # End time runs into the afternoon -> this is really a full-day class.
+    if ($endMin -lt 90000 -and $endMin -gt $afternoonStartMin) {
+        $clone = [ordered]@{}
+        foreach ($prop in $row.PSObject.Properties) { $clone[$prop.Name] = $prop.Value }
+        $clone[$cPeriod] = 'Afternoon Session'
+        $clone[$cStart]  = $afternoonStart
+        $cloneObj = [pscustomobject]$clone
+        $cloneObj | Add-Member -NotePropertyName '_Synth' -NotePropertyValue $true
+        $synthRows += $cloneObj
+    }
+}
+if ($synthRows.Count -gt 0) {
+    $dataRows += $synthRows
+    Write-Host ("Fixed   : added {0} afternoon duplicate(s) for full-day Morning classes" -f $synthRows.Count)
+}
+
+# ---- Sort -----------------------------------------------------------------
+$enriched = foreach ($row in $dataRows) {
+    $di = Get-DayInfo $row
+    [pscustomobject]@{
+        Row       = $row
+        DayOrder  = $di.Order
+        DayLabel  = $di.Label
+        RoomKey   = "$($row.$cRoom)"
+        PeriodKey = "$($row.$cPeriod)"
+        TitleKey  = "$($row.$cTitle)"
+        TimeKey   = Get-TimeSortKey "$($row.$cStart)"
+        IsSynth   = [bool]$row.'_Synth'
+    }
+}
+
+# Sort: Day -> Start Time -> Room -> Class Title
+$sorted = $enriched | Sort-Object DayOrder, TimeKey, RoomKey, TitleKey
+
+# ---- Build HTML -----------------------------------------------------------
+$generated = Get-Date -Format 'dddd, MMMM d, yyyy h:mm tt'
+$srcLeaves = $inputFiles | ForEach-Object { Split-Path $_ -Leaf }
+if ($srcLeaves.Count -eq 1) { $srcName = $srcLeaves[0] }
+else { $srcName = "$($srcLeaves.Count) files: " + ($srcLeaves -join ', ') }
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">')
+[void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
+[void]$sb.AppendLine('<title>Class Schedule Report</title>')
+[void]$sb.AppendLine(@'
+<style>
+  :root{--accent:#2f5496;--accent2:#1f3864;--bg:#f4f6fb;--line:#dde3ee;}
+  *{box-sizing:border-box;}
+  body{font-family:"Segoe UI",Arial,sans-serif;margin:0;background:var(--bg);color:#1d2330;}
+  header{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;padding:28px 36px;}
+  header h1{margin:0 0 6px;font-size:24px;}
+  header .meta{font-size:13px;opacity:.9;}
+  .wrap{max-width:1200px;margin:0 auto;padding:24px 36px 60px;}
+  .summary{display:flex;gap:16px;flex-wrap:wrap;margin:18px 0 28px;}
+  .card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 20px;min-width:130px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+  .card .n{font-size:22px;font-weight:700;color:var(--accent);}
+  .card .l{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:#6b7280;}
+  h2.day{margin:34px 0 10px;padding:8px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:18px;}
+  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:13px;}
+  th{background:#eef2fb;text-align:left;padding:9px 11px;border-bottom:2px solid var(--line);color:var(--accent2);position:sticky;top:0;}
+  td{padding:8px 11px;border-bottom:1px solid #eef1f6;vertical-align:top;}
+  tr:nth-child(even) td{background:#fafbfe;}
+  tr:hover td{background:#eef4ff;}
+  .nowrap{white-space:nowrap;}
+  .filters{position:sticky;top:0;z-index:5;background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:0 0 8px;box-shadow:0 1px 3px rgba(0,0,0,.05);display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;}
+  .filters .fld{display:flex;flex-direction:column;gap:4px;}
+  .filters label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#6b7280;font-weight:600;}
+  .filters select,.filters input{padding:8px 10px;border:1px solid var(--line);border-radius:7px;font-size:13px;min-width:180px;font-family:inherit;background:#fff;}
+  .filters select:focus,.filters input:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent);}
+  .filters button{padding:8px 16px;border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:7px;font-size:13px;cursor:pointer;font-family:inherit;}
+  .filters button:hover{background:var(--accent2);}
+  .filters .count{font-size:12px;color:#6b7280;align-self:center;margin-left:auto;}
+  .day-section.hidden,tr.hidden{display:none;}
+  .day-section .shown-count{font-size:13px;font-weight:400;opacity:.85;}
+  tr.synth td{background:#fff8e6;}
+  tr.synth:hover td{background:#fff1cc;}
+  .badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:10px;background:#e6a700;color:#fff;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;vertical-align:middle;}
+  tr.room-start td{border-top:3px solid #000;}
+  footer{text-align:center;color:#8a92a6;font-size:12px;padding:24px;}
+  @page{size:8.5in 11in;margin:0.5in;}
+  @media print{
+    html,body{background:#fff;}
+    header{background:var(--accent)!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;padding:14px 18px;}
+    header h1{font-size:18px;}
+    .summary,.filters{display:none!important;}
+    .wrap{max-width:none;margin:0;padding:0;}
+    .day-section{page-break-before:always;break-before:page;}
+    .day-section:first-of-type{page-break-before:auto;break-before:auto;}
+    h2.day{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    table{font-size:10px;border:none;}
+    thead{display:table-header-group;}
+    th{background:#eef2fb!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    tr{page-break-inside:avoid;break-inside:avoid;}
+    tr.synth td{background:#fff8e6!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    tr.hidden{display:none!important;}
+    .badge{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    footer{display:none;}
+  }
+</style>
+'@)
+[void]$sb.AppendLine('</head><body>')
+[void]$sb.AppendLine('<header><h1>Class Schedule Report</h1>')
+[void]$sb.AppendLine("<div class=""meta"">Source: $(HtmlEncode $srcName) &nbsp;&bull;&nbsp; Generated: $(HtmlEncode $generated)</div></header>")
+[void]$sb.AppendLine('<div class="wrap">')
+
+# Summary cards
+$grouped = $sorted | Group-Object DayLabel
+[void]$sb.AppendLine('<div class="summary">')
+[void]$sb.AppendLine("<div class=""card""><div class=""n"">$($sorted.Count)</div><div class=""l"">Total Records</div></div>")
+[void]$sb.AppendLine("<div class=""card""><div class=""n"">$(@($sorted | Select-Object -ExpandProperty RoomKey -Unique | Where-Object {$_}).Count)</div><div class=""l"">Rooms</div></div>")
+[void]$sb.AppendLine("<div class=""card""><div class=""n"">$($grouped.Count)</div><div class=""l"">Days</div></div>")
+[void]$sb.AppendLine('</div>')
+
+# ---- Filter bar (Day / Class Title / Attendee) ----------------------------
+$dayOptions = $grouped | Sort-Object { ($_.Group | Select-Object -First 1).DayOrder } |
+              ForEach-Object { $_.Name }
+$titleOptions = $sorted | ForEach-Object { "$($_.Row.$cTitle)" } |
+                Where-Object { $_ } | Sort-Object -Unique
+$attOptions = $sorted | ForEach-Object { "$($_.Row.$cAtt)" } |
+              Where-Object { $_ } | Sort-Object -Unique
+$unitOptions = $sorted | ForEach-Object { "$($_.Row.$cUnit)" } |
+               Where-Object { $_ } | Sort-Object -Unique
+
+[void]$sb.AppendLine('<div class="filters">')
+[void]$sb.AppendLine('<div class="fld"><label for="fDay">Day</label><select id="fDay"><option value="">All days</option>')
+foreach ($d in $dayOptions) { [void]$sb.AppendLine("<option value=""$(HtmlEncode $d)"">$(HtmlEncode $d)</option>") }
+[void]$sb.AppendLine('</select></div>')
+[void]$sb.AppendLine('<div class="fld"><label for="fTitle">Class Title</label><select id="fTitle"><option value="">All classes</option>')
+foreach ($t in $titleOptions) { [void]$sb.AppendLine("<option value=""$(HtmlEncode $t)"">$(HtmlEncode $t)</option>") }
+[void]$sb.AppendLine('</select></div>')
+[void]$sb.AppendLine('<div class="fld"><label for="fAtt">Attendee</label><select id="fAtt"><option value="">All attendees</option>')
+foreach ($a in $attOptions) { [void]$sb.AppendLine("<option value=""$(HtmlEncode $a)"">$(HtmlEncode $a)</option>") }
+[void]$sb.AppendLine('</select></div>')
+[void]$sb.AppendLine('<div class="fld"><label for="fUnit">Unit</label><select id="fUnit"><option value="">All units</option>')
+foreach ($u in $unitOptions) { [void]$sb.AppendLine("<option value=""$(HtmlEncode $u)"">$(HtmlEncode $u)</option>") }
+[void]$sb.AppendLine('</select></div>')
+[void]$sb.AppendLine('<button type="button" id="fReset">Reset</button>')
+[void]$sb.AppendLine('<button type="button" id="fPrint">Print / Save PDF</button>')
+[void]$sb.AppendLine('<span class="count" id="fCount"></span>')
+[void]$sb.AppendLine('</div>')
+
+# Table per day, preserving requested day order
+foreach ($g in ($grouped | Sort-Object { ($_.Group | Select-Object -First 1).DayOrder })) {
+    [void]$sb.AppendLine("<section class=""day-section"" data-day=""$(HtmlEncode $g.Name)"">")
+    [void]$sb.AppendLine("<h2 class=""day"">$(HtmlEncode $g.Name) &mdash; <span class=""shown-count"">$($g.Count) classes</span></h2>")
+    [void]$sb.AppendLine('<table><thead><tr>')
+    foreach ($h in @('Room','Period','Start','End','Class Title','Class #','Instructor','Attendee','Unit')) {
+        [void]$sb.Append("<th>$h</th>")
+    }
+    [void]$sb.AppendLine('</tr></thead><tbody>')
+    foreach ($e in $g.Group) {
+        $r = $e.Row
+        $rowDay   = HtmlEncode $g.Name
+        $rowTitle = HtmlEncode "$($r.$cTitle)"
+        $rowAtt   = HtmlEncode "$($r.$cAtt)"
+        $rowUnit  = HtmlEncode "$($r.$cUnit)"
+        $rowRoom  = HtmlEncode "$($r.$cRoom)"
+        [void]$sb.Append("<tr data-day=""$rowDay"" data-title=""$rowTitle"" data-att=""$rowAtt"" data-unit=""$rowUnit"" data-room=""$rowRoom""$(if($e.IsSynth){' class="synth"'})>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cRoom)</td>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cPeriod)$(if($e.IsSynth){' <span class=""badge"">added</span>'})</td>")
+        [void]$sb.Append("<td class='nowrap'>$(HtmlEncode $r.$cStart)</td>")
+        [void]$sb.Append("<td class='nowrap'>$(HtmlEncode $r.$cEnd)</td>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cTitle)</td>")
+        [void]$sb.Append("<td class='nowrap'>$(HtmlEncode $r.$cNum)</td>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cInstr)</td>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cAtt)</td>")
+        [void]$sb.Append("<td>$(HtmlEncode $r.$cUnit)</td>")
+        [void]$sb.AppendLine('</tr>')
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+    [void]$sb.AppendLine('</section>')
+}
+
+[void]$sb.AppendLine('</div>')
+[void]$sb.AppendLine('<footer>Generated automatically from the Class Completion Data export.</footer>')
+[void]$sb.AppendLine(@'
+<script>
+(function(){
+  var fDay=document.getElementById("fDay"),fTitle=document.getElementById("fTitle"),
+      fAtt=document.getElementById("fAtt"),fUnit=document.getElementById("fUnit"),
+      fReset=document.getElementById("fReset"),fCount=document.getElementById("fCount");
+  var sections=Array.prototype.slice.call(document.querySelectorAll(".day-section"));
+  function apply(){
+    var day=fDay.value,title=fTitle.value,att=fAtt.value,unit=fUnit.value,total=0;
+    sections.forEach(function(sec){
+      var rows=sec.querySelectorAll("tbody tr"),visible=0,prevRoom=null;
+      Array.prototype.forEach.call(rows,function(tr){
+        var ok=(!day||tr.getAttribute("data-day")===day)&&
+               (!title||tr.getAttribute("data-title")===title)&&
+               (!att||tr.getAttribute("data-att")===att)&&
+               (!unit||tr.getAttribute("data-unit")===unit);
+        tr.classList.toggle("hidden",!ok);
+        if(ok){
+          var room=tr.getAttribute("data-room");
+          tr.classList.toggle("room-start",prevRoom!==null&&room!==prevRoom);
+          prevRoom=room;
+          visible++;
+        } else {
+          tr.classList.remove("room-start");
+        }
+      });
+      sec.classList.toggle("hidden",visible===0);
+      var c=sec.querySelector(".shown-count");
+      if(c)c.textContent=visible+" classes";
+      total+=visible;
+    });
+    fCount.textContent="Showing "+total+" record"+(total===1?"":"s");
+  }
+  [fDay,fTitle,fAtt,fUnit].forEach(function(el){el.addEventListener("change",apply);});
+  fReset.addEventListener("click",function(){fDay.value="";fTitle.value="";fAtt.value="";fUnit.value="";apply();});
+  var fPrint=document.getElementById("fPrint");
+  if(fPrint)fPrint.addEventListener("click",function(){window.print();});
+  apply();
+})();
+</script>
+'@)
+[void]$sb.AppendLine('</body></html>')
+
+[System.IO.File]::WriteAllText($OutputPath, $sb.ToString(), [System.Text.UTF8Encoding]::new($false))
+Write-Host "Report  : $OutputPath"
+Write-Host "Done. Opening report..."
+Start-Process $OutputPath
