@@ -12,6 +12,10 @@ There are **two ways** to use it — pick whichever you prefer:
 | Works on Mac/Chromebook | ✅ Yes | ❌ Windows only |
 | Best for | Most people | Automation / power users |
 
+📖 **Detailed step‑by‑step guides (with screenshots):**
+- **[Web App Guide](docs/WEB-APP-GUIDE.md)** — the no‑install browser tool (recommended)
+- **[PowerShell Guide](docs/POWERSHELL-GUIDE.md)** — the command‑line script
+
 ---
 
 ## Option A — Web App (recommended, no install)
