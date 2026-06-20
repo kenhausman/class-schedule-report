@@ -16,7 +16,7 @@ When you open the tool, you'll see a simple landing page with a file picker:
 
 ## Step 1 — Download the web app
 
-On this repo, open **`ClassScheduleReport.html`** and click the **Download raw file** button (the download icon, circled below). Save it anywhere — your Desktop or Downloads folder is fine.
+On this repo, open [**`ClassScheduleReport.html`**](https://github.com/kenhausman/class-schedule-report/blob/main/ClassScheduleReport.html) and click the **Download raw file** button (the download icon, circled below). Save it anywhere — your Desktop or Downloads folder is fine.
 
 ![Downloading ClassScheduleReport.html from GitHub using the Download raw file button](images/web-2-download.png)
 
@@ -57,6 +57,9 @@ From here you can:
 - **Spanning classes** — a course that runs across both the morning **and** afternoon sessions is automatically added to the afternoon and tagged **"added."**
 - **Multi‑day courses** — a course that meets on more than one day (e.g., Lifesaving on Wednesday **and** Thursday) is listed on **each** day it meets.
 - **Room dividers** — a bold line marks every change of room/area for easy scanning.
+
+###Use these instructions from this page:
+[**`ClassScheduleReport.html`**](https://github.com/kenhausman/class-schedule-report/blob/main/ClassScheduleReport.html)
 
 ---
 
